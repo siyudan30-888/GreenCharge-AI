@@ -95,13 +95,30 @@ def main() -> int:
 
     # ------------------------------------------------------------ 负荷指标 #
     section("3. 多场站负荷特征")
-    analysis = metrics.analyze_load(df, DEFAULT_TOU)
+    # 资产参数（桩数 × 单桩功率）逐场站不同，且**只有模拟数据才已知** ——
+    # 用户上传的真实数据里没有这两列，那时客观地显示「—」而不是编一个。
+    capacity_map = None
+    charger_power_map = None
+    if result.is_synthetic:
+        capacity_map = {p.name: p.rated_capacity_kw for p in synthetic.STATION_PROFILES}
+        charger_power_map = {p.name: p.charger_power_kw for p in synthetic.STATION_PROFILES}
+    analysis = metrics.analyze_load(
+        df, DEFAULT_TOU, capacity_kw=capacity_map, charger_power_kw=charger_power_map
+    )
     print(metrics.metrics_table(analysis.metrics).to_string(index=False))
     print()
+    if capacity_map:
+        print("资产假设（模拟数据自带，真实数据需另行提供）：")
+        for p in synthetic.STATION_PROFILES:
+            print(
+                f"  {p.name}: {p.n_chargers} 桩 × {p.charger_power_kw:g} kW "
+                f"= 额定容量 {p.rated_capacity_kw:,.0f} kW"
+            )
+        print()
     print("指标口径说明：")
     print("  负荷率     = 平均功率 / **实测**峰值功率（不是合同容量）")
     print("  峰谷差率   = 峰谷差 / **实测**峰值功率 × 100%")
-    print("  谷电利用率b= 谷时电量 / (额定容量 × 谷时小时数) × 100%")
+    print("  谷电利用率b= 谷时**日均**电量 / (额定容量 × 谷时小时数) × 100%")
     print("  桩利用率   = Σ充电时长 / (桩数 × 统计时长) × 100%")
     print("  注：额定容量相关指标在未提供容量时为「—」，不用默认值冒充。")
 
@@ -123,6 +140,14 @@ def main() -> int:
           f"{report.split_time:%Y-%m-%d %H:%M}）")
     print(f"测试集     : {report.n_test:,} 行（{report.split_time:%Y-%m-%d %H:%M} 之后）")
     print("划分方式   : **按时间顺序**留出最后 20%，不做随机打乱")
+    print()
+    print(f"主模型超参 : {report.hgb_config}"
+          "（在**训练集内部**的时间顺序验证集上选出，测试集未参与）")
+    if not report.hgb_search.empty:
+        print()
+        print("超参扫描前 5 名（内部验证集，共 "
+              f"{len(report.hgb_search)} 个候选）：")
+        print(report.hgb_search.head(5).to_string(index=False))
     print()
     print(report.metrics.to_string(index=False))
     print()
