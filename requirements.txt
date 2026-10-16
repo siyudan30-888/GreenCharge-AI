@@ -1,4 +1,16 @@
-streamlit>=1.40.0
-pandas>=2.2.0
-numpy>=1.26.0
-plotly>=5.24.0
+# GreenCharge-AI 运行依赖
+#
+# 安装方式（务必带 --only-binary=:all:，见 README 说明）：
+#     python -m pip install --only-binary=:all: -r requirements.txt
+#
+# 只锁顶层依赖，不锁传递依赖。理由：
+#   - 本项目需要 Python >= 3.11（pandas 3.x 与 streamlit 1.66 的下限）
+#   - 实测 Python 3.14 上以下版本全部提供 cp314 预编译轮子，无需 C 编译器
+#   - 若放开版本范围，pip 可能拉到已移除 use_container_width 的 streamlit，
+#     应用会在演示前直接 TypeError 崩溃
+
+streamlit==1.66.0
+pandas==3.0.6
+scikit-learn==1.9.1
+plotly==7.1.0
+numpy>=2.3.3,<3
