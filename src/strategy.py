@@ -118,27 +118,39 @@ class ShiftPlan:
 
     station: str
     peak_energy_kwh: float
+    """峰时**日均**电量（kWh/日）。"""
     valley_energy_kwh: float
+    """谷时**日均**电量（kWh/日）。"""
     valley_margin_kwh: float | None
-    """谷时可用裕度 = 额定容量 × 谷时小时数 − 谷时实际电量。未知容量时为 None。"""
+    """谷时可用裕度 = 额定容量 × 谷时小时数 − 谷时日均电量（kWh/日）。
+    未知容量时为 None。"""
     theta: float
     candidate_kwh: float
-    """按 θ 计算的可延展电量 = E_峰 × θ"""
+    """按 θ 计算的可延展电量 = E_峰(日均) × θ（kWh/日）"""
     shiftable_kwh: float
-    """最终可转移电量 = min(candidate, 谷时裕度)"""
+    """最终可转移电量 = min(candidate, 谷时裕度)（kWh/日）"""
     binding_constraint: str
     """「θ」表示假设是限制因素；「谷时可用裕度」表示物理容量是限制因素。"""
     peak_reduction_kw: float
-    """削峰量 = 可转移电量 / 峰时小时数"""
+    """削峰量 = 可转移电量(kWh/日) / 峰时小时数 —— 量纲为 kW，因为分母是「小时/日」。"""
     peak_window_hours: int
     valley_window_hours: int
 
 
-def valley_margin(capacity_kw: float | None, tou: TouConfig, valley_energy_kwh: float) -> float | None:
-    """谷时可用裕度 H_谷 = 额定容量 × 谷时小时数 − 谷时实际电量。
+def valley_margin(
+    capacity_kw: float | None,
+    tou: TouConfig,
+    valley_energy_daily_kwh: float,
+) -> float | None:
+    """谷时可用裕度 H_谷 = 额定容量 × 谷时小时数 − 谷时**日均**实际电量。
 
     **这是本模块取代那个凭空常数 0.25 的关键。** 它是物理容量，由数据导出，
     不是猜的。
+
+    ⚠️ **量纲警告：入参必须是日均电量，不是期间累计电量。**
+    `capacity_kw × valley_hours` 是**单日**可充电量（kWh/日）。若拿 28 天的
+    累计谷时电量去减，结果会荒谬地偏大或偏小，而且不会报错 —— 只会让
+    敏感性表每一行数字都相同。调用方须先除以天数。
 
     简化说明：这里假定谷时各小时同等可用。若谷时本身已接近满负荷
     （例如枢纽整夜都有营运车辆充电），实际裕度会小于此值 ——
@@ -146,7 +158,7 @@ def valley_margin(capacity_kw: float | None, tou: TouConfig, valley_energy_kwh: 
     """
     if capacity_kw is None or capacity_kw <= 0:
         return None
-    return max(capacity_kw * tou.valley_hours - valley_energy_kwh, 0.0)
+    return max(capacity_kw * tou.valley_hours - valley_energy_daily_kwh, 0.0)
 
 
 def plan_shift(
@@ -159,17 +171,24 @@ def plan_shift(
     peak_energy_kwh: float | None = None,
     valley_energy_kwh: float | None = None,
 ) -> ShiftPlan:
-    """计算某场站的削峰填谷方案。"""
+    """计算某场站的削峰填谷方案。
+
+    **本函数内部一律按「日」计算。** 传入的峰谷电量是期间累计值，先除以
+    `metrics.n_days` 折算成日均，再与单日容量比较；否则量纲不一致。
+    返回的 ShiftPlan 中所有电量字段均为**日均值（kWh/日）**。
+    """
+    n_days = max(float(metrics.n_days), 1.0)
+
     peak_e = (
         peak_energy_kwh
         if peak_energy_kwh is not None
         else metrics.total_kwh * metrics.peak_energy_pct / 100.0
-    )
+    ) / n_days
     valley_e = (
         valley_energy_kwh
         if valley_energy_kwh is not None
         else metrics.total_kwh * metrics.valley_energy_pct / 100.0
-    )
+    ) / n_days
 
     margin = valley_margin(capacity_kw, tou, valley_e)
     candidate = peak_e * assumptions.theta
@@ -225,15 +244,19 @@ def sensitivity_table(
 
     | 列 | 公式 |
     | --- | --- |
-    | 转移电量 | `min(E_峰 × θ, H_谷)` |
+    | 转移电量 | `min(E_峰 × θ, H_谷)`，**日均** |
     | 削峰量 | `转移电量 / 峰时小时数` |
-    | 碳减排 | `转移电量 × (峰时边际因子 − 谷时边际因子)` |
-    | 用户节省 | `转移电量 × (峰时服务费上浮 + 额外积分价值)` |
-    | 运营商服务费变化 | `转移电量 × (谷时费率 − 峰时费率)` |
+    | 碳减排 | `转移电量 × (峰时边际因子 − 谷时边际因子)`，**日均** |
+    | 用户节省 | `转移电量 × (峰时服务费上浮 + 额外积分价值)`，**日均** |
+    | 运营商服务费变化 | `转移电量 × (谷时费率 − 峰时费率)`，**日均** |
     | 月度需量电费节省 | `削峰量 × 需量电价`（仅当假定当日峰值即当月最大需量） |
+
+    **全表按「日」为口径**：峰谷电量先折算成日均，再与单日容量比较。
+    否则 28 天的累计电量与单日容量直接相除，会让每一行得出相同数字。
     """
-    peak_e = metrics.total_kwh * metrics.peak_energy_pct / 100.0
-    valley_e = metrics.total_kwh * metrics.valley_energy_pct / 100.0
+    n_days = max(float(metrics.n_days), 1.0)
+    peak_e = metrics.total_kwh * metrics.peak_energy_pct / 100.0 / n_days
+    valley_e = metrics.total_kwh * metrics.valley_energy_pct / 100.0 / n_days
     margin = valley_margin(capacity_kw, tou, valley_e)
 
     valley_rate = assumptions.service_fee_base
@@ -270,12 +293,12 @@ def sensitivity_table(
         rows.append(
             {
                 "转移比例 θ": theta,
-                "转移电量 (kWh)": round(shifted, 1),
+                "转移电量 (kWh/日)": round(shifted, 1),
                 "削峰量 (kW)": round(peak_reduction, 1),
-                "碳减排 (kg CO₂)": round(carbon_result.shift_saving_kg, 1),
-                "用户节省 (元)": round(user_saving, 1),
-                "运营商服务费变化 (元)": round(operator_delta, 1),
-                "月度需量电费节省 (元)": (
+                "碳减排 (kg CO₂/日)": round(carbon_result.shift_saving_kg, 1),
+                "用户节省 (元/日)": round(user_saving, 1),
+                "运营商服务费变化 (元/日)": round(operator_delta, 1),
+                "月度需量电费节省 (元/月)": (
                     round(demand_saving, 0) if np.isfinite(demand_saving) else "—"
                 ),
                 "备注": constrained,

@@ -159,6 +159,13 @@ class StationLoadMetrics:
     valley_kw: float
     mean_kw: float
 
+    n_days: float
+    """统计覆盖的自然日天数。**所有「日均」换算都必须经过它。**
+
+    谷时可用裕度与谷电利用率的分母是「额定容量 × 谷时小时数」，即**单日**
+    可充电量；分子若直接用期间累计电量，结果会高估 n_days 倍（本项目 28 天
+    即 28 倍）。这是一个不会报错、只会给出荒谬数字的错误，故显式记录在这里。"""
+
     load_factor: float
     """: 负荷率 = 平均功率 / 峰值功率。0–1，越高表示曲线越平坦、资产利用越充分。
     ⚠️ 本处的峰值取**实测小时峰值**，不是合同容量。两者会给出不同的负荷率。"""
@@ -200,23 +207,38 @@ def _station_energy_by_period(df: pd.DataFrame, tou: TouConfig) -> dict[str, flo
     return out
 
 
+def _per_station(value: float | dict[str, float] | None, station: str) -> float | None:
+    """把「标量或按场站的字典」解析成该场站的取值。
+
+    三个场站的额定容量本来就不同（商场 24 桩 × 60 kW、园区 60 桩 × 7 kW、
+    枢纽 16 桩 × 120 kW），只接受一个标量会强迫其中两个用错值。
+    """
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return value.get(station)
+    return float(value)
+
+
 def station_load_metrics(
     df: pd.DataFrame,
     curve: LoadCurve,
     tou: TouConfig = DEFAULT_TOU,
     *,
-    capacity_kw: float | None = None,
-    charger_power_kw: float | None = None,
+    capacity_kw: float | dict[str, float] | None = None,
+    charger_power_kw: float | dict[str, float] | None = None,
 ) -> list[StationLoadMetrics]:
     """计算每个场站的负荷指标。
 
     Parameters
     ----------
     capacity_kw:
-        场站额定容量（kW）。为 None 时，依赖容量的两个指标返回 None，
+        场站额定容量（kW）。可以是标量，也可以是 `{场站名: 容量}` 的字典。
+        为 None 时，依赖容量的两个指标返回 None，
         界面应显示「需要额定容量」而**不是**用某个默认值冒充。
     charger_power_kw:
-        单桩额定功率（kW），用于由容量反推桩数，进而计算桩利用率。
+        单桩额定功率（kW），同样支持标量或字典。用于由容量反推桩数，
+        进而计算桩利用率。
     """
     results: list[StationLoadMetrics] = []
 
@@ -224,6 +246,9 @@ def station_load_metrics(
         s_curve = curve.frame[curve.frame["场站名称"] == station]
         if s_curve.empty:
             continue
+
+        st_capacity = _per_station(capacity_kw, str(station))
+        st_charger_power = _per_station(charger_power_kw, str(station))
 
         power = s_curve["功率_kW"].to_numpy(dtype=float)
         peak_kw = float(power.max())
@@ -240,20 +265,28 @@ def station_load_metrics(
         peak_pct = energy[PEAK] / total * 100.0 if total > 0 else float("nan")
         valley_pct = energy[VALLEY] / total * 100.0 if total > 0 else float("nan")
 
+        # 统计覆盖的自然日天数：按**去重日期**数，而不是跨度/24，
+        # 这样数据中间有缺口时不会把分母算大。
+        n_days = float(sub["日期"].nunique()) if "日期" in sub.columns else 1.0
+        n_days = max(n_days, 1.0)
+
         valley_util: float | None = None
-        if capacity_kw and capacity_kw > 0 and tou.valley_hours > 0:
-            valley_util = energy[VALLEY] / (capacity_kw * tou.valley_hours) * 100.0
+        if st_capacity and st_capacity > 0 and tou.valley_hours > 0 and n_days > 0:
+            # 分子必须折算成**日均**谷时电量，才能与「单日容量」相比。
+            valley_util = (
+                energy[VALLEY] / n_days / (st_capacity * tou.valley_hours) * 100.0
+            )
 
         charger_util: float | None = None
         if (
-            capacity_kw
-            and capacity_kw > 0
-            and charger_power_kw
-            and charger_power_kw > 0
+            st_capacity
+            and st_capacity > 0
+            and st_charger_power
+            and st_charger_power > 0
             and "充电时长_分钟" in sub.columns
             and sub["充电时长_分钟"].notna().any()
         ):
-            n_chargers = capacity_kw / charger_power_kw
+            n_chargers = st_capacity / st_charger_power
             span_hours = _observed_span_hours(sub)
             if span_hours > 0 and n_chargers > 0:
                 busy_hours = float(sub["充电时长_分钟"].sum()) / 60.0
@@ -267,6 +300,7 @@ def station_load_metrics(
                 peak_kw=peak_kw,
                 valley_kw=valley_kw,
                 mean_kw=mean_kw,
+                n_days=n_days,
                 load_factor=load_factor,
                 peak_valley_diff_kw=diff,
                 peak_valley_ratio_pct=ratio,
@@ -464,8 +498,8 @@ def analyze_load(
     df: pd.DataFrame,
     tou: TouConfig = DEFAULT_TOU,
     *,
-    capacity_kw: float | None = None,
-    charger_power_kw: float | None = None,
+    capacity_kw: float | dict[str, float] | None = None,
+    charger_power_kw: float | dict[str, float] | None = None,
 ) -> LoadAnalysis:
     curve = hourly_load(df)
     return LoadAnalysis(
@@ -522,7 +556,11 @@ def daily_shape_matrix(curve: LoadCurve) -> tuple[np.ndarray, pd.DataFrame]:
 
 
 def cluster_daily_shapes(
-    curve: LoadCurve, k_range: tuple[int, ...] = (2, 3, 4, 5)
+    curve: LoadCurve,
+    k_range: tuple[int, ...] = (2, 3, 4, 5),
+    *,
+    min_cluster_size: int | None = None,
+    tie_tolerance: float = 0.01,
 ) -> ClusterResult | None:
     """对归一化日形态做 k-means，并用**轮廓系数**选择 k。
 
@@ -530,8 +568,21 @@ def cluster_daily_shapes(
     与「周末休闲」两种日型）。这直接指导有序充电 —— 它告诉你能转移的是**哪些日子**，
     而不只是「总共能转移多少」。同时也让原本空洞的「多场站负荷特征分析」第一次有内容。
 
-    **诚实要求**：k 由轮廓系数扫描决定，绝不因为「有三个场站」就断言 k=3。
-    样本量不足时返回 None，而不是硬跑出一个不可信的结果。
+    **诚实要求一**：k 由轮廓系数扫描决定，绝不因为「有三个场站」就断言 k=3。
+
+    **诚实要求二（容易漏掉的一条）**：必须识别**由离群点撑起来的解**。
+    轮廓系数偏好「一个孤立点 + 其余全部」这种划分 —— 把最难解释的那个点
+    单独隔离开，分数反而很高。但那不是一种运行形态，只是几天异常数据。
+    因此这里要求至少 `min_cluster_size` 个样本才算一个「实质形态」
+    （默认 max(3, 5% 样本量)），并区分两种情况：
+
+    - 实质形态数 ≥ 2：合法解，其中过小的簇在结果里**标记为「离群日」**，
+      不再冒充一种形态。轮廓系数在这些解之间比较。
+    - 实质形态数 < 2：说明数据里没有可复现的日型，该 k 不参与比较。
+
+    每个 k 的**最小簇规模与实质形态数**都会随结果一并返回，
+    让扫描过程可审计，而不是只给一个结论。轮廓系数相差不足 `tie_tolerance`
+    时取更小的 k —— 避免把同一形态过度切分。
     """
     from sklearn.cluster import KMeans
     from sklearn.metrics import silhouette_score
@@ -543,31 +594,58 @@ def cluster_daily_shapes(
     if len(feasible) < 2:
         return None
 
+    if min_cluster_size is None:
+        min_cluster_size = max(3, int(round(0.05 * n_samples)))
+
     scores = []
     for k in feasible:
         model = KMeans(n_clusters=k, n_init=10, random_state=42)
         labels = model.fit_predict(matrix)
         if len(set(labels)) < 2:
             continue
-        scores.append({"k": k, "轮廓系数": float(silhouette_score(matrix, labels))})
+        sizes = np.bincount(labels, minlength=k)
+        n_substantive = int((sizes >= min_cluster_size).sum())
+        scores.append(
+            {
+                "k": k,
+                "轮廓系数": float(silhouette_score(matrix, labels)),
+                "最小簇规模": int(sizes.min()),
+                "实质形态数": n_substantive,
+                "可用": "是" if n_substantive >= 2 else "否（不足以构成两种形态）",
+            }
+        )
     if not scores:
         return None
 
     k_scores = pd.DataFrame(scores)
-    best_k = int(k_scores.loc[k_scores["轮廓系数"].idxmax(), "k"])
+    usable = k_scores[k_scores["可用"] == "是"]
+    if usable.empty:
+        return None
+
+    # 平手（差值在容差内）时取更小的 k，避免过度切分
+    top_score = float(usable["轮廓系数"].max())
+    near_tie = usable[usable["轮廓系数"] >= top_score - tie_tolerance]
+    best_k = int(near_tie["k"].min())
 
     final = KMeans(n_clusters=best_k, n_init=10, random_state=42)
     labels = final.fit_predict(matrix)
+    sizes = np.bincount(labels, minlength=best_k)
+
+    # 大到足以称为「形态」的簇依次编号；过小的簇统一标为「离群日」
+    substantive = [i for i in range(best_k) if sizes[i] >= min_cluster_size]
+    name_of = {c: f"形态{chr(65 + j)}" for j, c in enumerate(substantive)}
+    for i in range(best_k):
+        name_of.setdefault(i, "离群日")
 
     labels_frame = index.copy()
-    labels_frame["簇"] = [f"形态{chr(65 + i)}" for i in labels]
+    labels_frame["簇"] = [name_of[int(i)] for i in labels]
     counts = labels_frame["簇"].value_counts(normalize=True)
     labels_frame["簇内占比"] = labels_frame["簇"].map(lambda c: round(float(counts[c]), 3))
 
     profiles = pd.DataFrame(
         final.cluster_centers_, columns=[f"{h}时" for h in range(24)]
     )
-    profiles.insert(0, "簇", [f"形态{chr(65 + i)}" for i in range(best_k)])
+    profiles.insert(0, "簇", [name_of[i] for i in range(best_k)])
 
     return ClusterResult(
         k=best_k,
