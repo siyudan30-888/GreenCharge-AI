@@ -609,23 +609,29 @@ def render_strategy_tab(df, analysis, per_station_metrics, assets, params) -> No
         "而那个 `0.25` 是凭空写下的常数。本系统改用下式："
     )
     st.latex(r"E_{\text{可转移}} = \min\left(E_{\text{峰}} \times \theta,\; H_{\text{谷}}\right)")
+    st.caption(
+        "**全表以「日」为口径。** 峰谷电量均先折算成日均值，再与单日额定容量比较 —— "
+        "否则 28 天的累计电量与一天的容量直接相除，量纲不一致，"
+        "结果会荒谬地让每一行得出相同数字。"
+    )
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("E_峰：峰时总电量", f"{plan.peak_energy_kwh:,.0f} kWh")
+    c1.metric("E_峰：峰时日均电量", f"{plan.peak_energy_kwh:,.0f} kWh/日")
     c2.metric("θ：可延展比例", f"{plan.theta:.2f}", help="可调假设，见下方面板")
     c3.metric(
         "H_谷：谷时可用裕度",
-        f"{plan.valley_margin_kwh:,.0f} kWh" if plan.valley_margin_kwh is not None else "—",
-        help="= 额定容量 × 谷时小时数 − 谷时实际电量。由数据导出，不是猜的。",
+        f"{plan.valley_margin_kwh:,.0f} kWh/日" if plan.valley_margin_kwh is not None else "—",
+        help="= 额定容量 × 谷时小时数 − 谷时**日均**电量。由数据导出，不是猜的。",
     )
-    c4.metric("可转移电量", f"{plan.shiftable_kwh:,.0f} kWh",
+    c4.metric("可转移电量", f"{plan.shiftable_kwh:,.0f} kWh/日",
               delta=f"削峰 {plan.peak_reduction_kw:,.1f} kW", delta_color="off")
 
     if plan.binding_constraint.startswith("谷时"):
         st.warning(
             f"**受谷时可用裕度限制。** 按 θ={plan.theta:.2f} 本可转移 "
-            f"{plan.candidate_kwh:,.0f} kWh，但谷时段只有 {plan.valley_margin_kwh:,.0f} kWh "
-            f"的可用裕度，因此实际可转移 {plan.shiftable_kwh:,.0f} kWh。"
+            f"{plan.candidate_kwh:,.0f} kWh/日，但谷时段只有 "
+            f"{plan.valley_margin_kwh:,.0f} kWh/日 "
+            f"的可用裕度，因此实际可转移 {plan.shiftable_kwh:,.0f} kWh/日。"
             "**瓶颈不在用户意愿，而在谷时段本身已接近满载** —— "
             "继续加码激励不会有效。"
         )
