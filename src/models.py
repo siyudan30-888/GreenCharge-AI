@@ -553,9 +553,26 @@ def forecast_horizon(
         return pd.DataFrame(columns=["时刻", "预测_kWh"])
 
     n_hist = int((work["时刻"] <= origin).sum())
-    # 需要 168 小时预热 + 至少 1 小时可预测
-    if n_hist < 169 or n_hist >= len(work):
+    # 需要 168 小时预热，否则 lag_168 读不到一周前的值
+    if n_hist < 169:
         return pd.DataFrame(columns=["时刻", "预测_kWh"])
+
+    # 工作表里必须有「未来」行供递归逐小时填充。
+    # 回测时 origin 落在数据中段，未来行本来就在表里；
+    # 但线上预测的 origin 是**最后一个观测小时**，此时表里一行未来都没有 ——
+    # 必须按小时补出 horizon 个空槽，否则本函数在线上恒返回空表。
+    # （这个分支曾经缺失，导致策略页的「未来 24 小时预测」永远显示
+    #  「数据不足」而从不画图，而回测指标一切正常，所以指标上看不出来。）
+    if n_hist >= len(work):
+        future_times = pd.date_range(
+            start=pd.Timestamp(work["时刻"].iloc[n_hist - 1]) + pd.Timedelta(hours=1),
+            periods=horizon,
+            freq="h",
+        ).astype(work["时刻"].dtype)
+        pad = pd.DataFrame({"时刻": future_times})
+        for col in (TARGET, *AUX_COLUMNS):
+            pad[col] = np.nan
+        work = pd.concat([work, pad], ignore_index=True)
 
     # 递归中未知的辅助量用持久化值：假定未来小时维持 origin 处的最后观测水平
     persist = {
