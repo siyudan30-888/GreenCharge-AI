@@ -112,7 +112,25 @@ def all_metrics(y_true, y_pred) -> dict[str, float]:
 # 模型
 # --------------------------------------------------------------------------- #
 
-def make_gradient_boosting() -> HistGradientBoostingRegressor:
+#: 超参候选网格。**用训练集内部的时间顺序验证集来选，绝不使用测试集。**
+#: 网格刻意取小：45 个组合在约 1000 行上总耗时数秒，且候选越少越不容易
+#: 在验证集上过拟合（选择本身也是一种拟合）。
+HGB_GRID: dict[str, tuple] = {
+    "max_iter": (60, 100, 150, 200, 300),
+    "learning_rate": (0.03, 0.05, 0.08),
+    "l2_regularization": (0.0, 0.1, 1.0),
+}
+
+#: 从训练集尾部留出的内部验证集比例
+HGB_VALIDATION_FRACTION = 0.15
+
+
+def make_gradient_boosting(
+    *,
+    max_iter: int = 100,
+    learning_rate: float = 0.05,
+    l2_regularization: float = 0.1,
+) -> HistGradientBoostingRegressor:
     """主模型：直方图梯度提升回归。
 
     选它的理由：
@@ -126,15 +144,86 @@ def make_gradient_boosting() -> HistGradientBoostingRegressor:
 
     `early_stopping=False` 是**刻意**的：sklearn 默认 `'auto'` 会从训练数据里
     **随机**切出一部分作验证集 —— 在时序数据上这是跨时间泄漏。
-    固定轮数 + 低学习率 + 适度 L2 是这个规模下诚实的做法。
+    因此轮数不由 sklearn 自动决定，而由 `select_hgb_config()` 在
+    **时间顺序**的内部验证集上显式选出。
+
+    默认参数只是兜底值；实际使用的值来自 `select_hgb_config()`，
+    并会随 `ModelReport.hgb_config` 一起披露。
     """
     return HistGradientBoostingRegressor(
-        max_iter=300,
-        learning_rate=0.05,
+        max_iter=max_iter,
+        learning_rate=learning_rate,
         early_stopping=False,
-        l2_regularization=0.1,
+        l2_regularization=l2_regularization,
         random_state=RANDOM_STATE,
     )
+
+
+def select_hgb_config(
+    train_frame: pd.DataFrame,
+    feature_columns: list[str],
+    *,
+    grid: dict[str, tuple] | None = None,
+    validation_fraction: float = HGB_VALIDATION_FRACTION,
+) -> tuple[dict[str, float], pd.DataFrame]:
+    """在**训练集内部**的时间顺序验证集上选梯度提升的超参。
+
+    为什么必须这样做：样本只有约 1200 行，300 轮 + 无早停会明显过拟合
+    （实测测试集 MAE 111.2，反而不如岭回归的 104.5）。
+    但**不能**看着测试集去调参 —— 那是把测试集变成了训练集的一部分，
+    报出来的指标就不可信了。
+
+    做法：把训练集按时间顺序再切一刀，前 85% 作内部训练、后 15% 作内部验证，
+    在验证集上扫网格取最优，再回到**完整训练集**重训。
+    测试集从头到尾没有参与任何选择。
+
+    Returns
+    -------
+    (最优参数, 全部候选的验证结果表)
+    """
+    grid = grid or HGB_GRID
+
+    times = np.sort(train_frame["时刻"].unique())
+    cut_pos = min(int(len(times) * (1.0 - validation_fraction)), len(times) - 1)
+    cut = times[cut_pos]
+
+    inner_train = train_frame[train_frame["时刻"] < cut]
+    inner_valid = train_frame[train_frame["时刻"] >= cut]
+    if inner_train.empty or inner_valid.empty:
+        return {"max_iter": 100, "learning_rate": 0.05, "l2_regularization": 0.1}, pd.DataFrame()
+
+    X_in = inner_train[feature_columns]
+    y_in = inner_train[TARGET].to_numpy(dtype=float)
+    X_va = inner_valid[feature_columns]
+    y_va = inner_valid[TARGET].to_numpy(dtype=float)
+
+    rows = []
+    for max_iter in grid["max_iter"]:
+        for lr in grid["learning_rate"]:
+            for l2 in grid["l2_regularization"]:
+                model = make_gradient_boosting(
+                    max_iter=max_iter, learning_rate=lr, l2_regularization=l2
+                )
+                model.fit(X_in, y_in)
+                rows.append(
+                    {
+                        "max_iter": max_iter,
+                        "learning_rate": lr,
+                        "l2_regularization": l2,
+                        "内部验证 MAE (kWh)": round(
+                            mae(y_va, np.maximum(model.predict(X_va), 0.0)), 3
+                        ),
+                    }
+                )
+
+    table = pd.DataFrame(rows).sort_values("内部验证 MAE (kWh)").reset_index(drop=True)
+    top = table.iloc[0]
+    best = {
+        "max_iter": int(top["max_iter"]),
+        "learning_rate": float(top["learning_rate"]),
+        "l2_regularization": float(top["l2_regularization"]),
+    }
+    return best, table
 
 
 def make_ridge() -> Pipeline:
@@ -211,6 +300,10 @@ class ModelReport:
     model: object = None
     feature_columns: list[str] = field(default_factory=list)
     station_columns: list[str] = field(default_factory=list)
+    hgb_config: dict[str, float] = field(default_factory=dict)
+    """主模型实际使用的超参。由训练集内部的验证集选出，**测试集未参与**。"""
+    hgb_search: pd.DataFrame = field(default_factory=pd.DataFrame)
+    """超参扫描的全部候选及其内部验证 MAE —— 让「怎么选的」可被审计。"""
 
 
 def train_and_evaluate(
@@ -235,10 +328,17 @@ def train_and_evaluate(
 
     notes: list[str] = []
 
-    # ---- 主模型 ------------------------------------------------------------ #
-    hgb = make_gradient_boosting()
+    # ---- 主模型：超参先在训练集内部选，再回到完整训练集重训 ---------------- #
+    hgb_config, hgb_search = select_hgb_config(train, features.feature_columns)
+    hgb = make_gradient_boosting(**hgb_config)
     hgb.fit(X_train, y_train)
     pred_hgb = hgb.predict(X_test)
+    notes.append(
+        "主模型超参在**训练集内部**的时间顺序验证集上选出"
+        f"（max_iter={hgb_config['max_iter']}、learning_rate={hgb_config['learning_rate']}、"
+        f"l2_regularization={hgb_config['l2_regularization']}），"
+        "测试集从头到尾未参与任何选择；完整候选表见「超参扫描」。"
+    )
 
     # ---- 对照组 ------------------------------------------------------------ #
     ridge = make_ridge()
@@ -370,6 +470,8 @@ def train_and_evaluate(
         model=hgb,
         feature_columns=list(features.feature_columns),
         station_columns=list(features.station_columns),
+        hgb_config=hgb_config,
+        hgb_search=hgb_search,
     )
 
 
