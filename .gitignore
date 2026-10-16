@@ -1,0 +1,28 @@
+# 虚拟环境 —— 绝不入库
+.venv/
+venv/
+env/
+
+# Python 字节码
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 构建产物
+build/
+dist/
+*.egg-info/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Streamlit 本地配置（可能含个人设置）
+.streamlit/secrets.toml
+
+# 上传的真实场站数据 —— 竞赛数据可能涉密，绝不入库
+data/
+*.csv
+!docs/sample.csv
