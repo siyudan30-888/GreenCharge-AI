@@ -27,8 +27,12 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
-#: 预测目标
+#: 预测目标 —— **聚合之后**的列名（本模块自己产出）
 TARGET = "电量_kWh"
+
+#: 明细表里的电量列名（数据契约中的原始列名）。二者名称相近，
+#: 但一个是输入、一个是输出，混用会直接 KeyError，故分成两个常量。
+ENERGY_SOURCE = "充电量_kWh"
 
 #: 周期编码列。**为什么不用整数编码**：整数编码会让 23 点与 0 点看起来距离最远，
 #: 而实际它们相邻；正弦/余弦编码把「一天」映射成圆，使相邻小时在特征空间里也相邻。
@@ -81,12 +85,12 @@ def aggregate_hourly(df: pd.DataFrame) -> pd.DataFrame:
     df["时刻"] = df["充电开始时间"].dt.floor("h")
 
     aggregations: dict[str, tuple[str, str]] = {
-        "电量_kWh": (TARGET, "sum"),
-        "订单数": ("订单ID", "size") if "订单ID" in df.columns else ("充电量_kWh", "size"),
+        TARGET: (ENERGY_SOURCE, "sum"),
+        "订单数": ("订单ID", "size") if "订单ID" in df.columns else (ENERGY_SOURCE, "size"),
     }
     if "充电时长_分钟" in df.columns:
         aggregations["平均时长"] = ("充电时长_分钟", "mean")
-    aggregations["单均电量"] = ("充电量_kWh", "mean")
+    aggregations["单均电量"] = (ENERGY_SOURCE, "mean")
 
     agg = df.groupby(["场站名称", "时刻"], observed=True).agg(**aggregations).reset_index()
 

@@ -85,6 +85,19 @@ SYNTHETIC_START_DATE = "2026-09-28"
 #: exp(2 × 1.2816 × σ) ≈ 1.76 倍（σ=0.22）。
 SYNTHETIC_SIGMA_DAY = 0.22
 
+#: 日效应的一阶自相关系数（对数空间 AR(1)）。
+#:
+#: **为什么不是逐日独立抽取。** 充电量的日间波动主要来自天气与气温，而天气系统
+#: 是有持续性的 —— 今天降温，明天大概率还是冷。逐日独立抽取等于假设「每天的
+#: 好坏毫无关联」，那是把真实世界里的可预测成分删掉了，会让「用滞后特征预测」
+#: 这件事在原理上失去价值。0.65 对应典型的天气过程持续时间（约 2–3 天）。
+#:
+#: **这一项直接决定模型能比朴素基线好多少**，因此它和 sigma 一样，是必须
+#: 在 README 里披露的生成器参数，而不是可以随手调的旋钮：
+#: ρ 越大，「昨天同一时刻的电量」对今天的指示意义越强，模型相对基线的优势越大。
+#: 真实场站的 ρ 是多少，需要真实数据才能估计，本平台不作断言。
+SYNTHETIC_RHO_DAY = 0.65
+
 #: 单次充电效率的取值范围（交流/直流综合）。用于 E = P·(D/60)·η。
 SYNTHETIC_ETA_RANGE = (0.60, 0.95)
 
@@ -262,6 +275,31 @@ RAW_COLUMNS: tuple[str, ...] = (
 # 生成
 # --------------------------------------------------------------------------- #
 
+def _ar1_day_effect(
+    rng: np.random.Generator,
+    n_days: int,
+    sigma: float = SYNTHETIC_SIGMA_DAY,
+    rho: float = SYNTHETIC_RHO_DAY,
+) -> np.ndarray:
+    """逐日效应（对数空间 AR(1)）：x_d = ρ·x_{d−1} + ε_d，返回 exp(x)。
+
+    与逐日独立抽取的区别，以及为什么这样更真实，见 `SYNTHETIC_RHO_DAY` 的注释。
+
+    实现要点：新息标准差取 `σ·√(1−ρ²)`，使序列的**平稳方差仍为 σ²** ——
+    否则 ρ 一变，日效应的整体波动幅度也跟着变，就无法单独讨论「持续性」
+    的作用了。首日按平稳分布抽取。
+    """
+    if rho <= 0:
+        return rng.lognormal(mean=0.0, sigma=sigma, size=n_days)
+
+    innovation = rng.normal(0.0, sigma * np.sqrt(max(1.0 - rho**2, 0.0)), size=n_days)
+    log_effect = np.empty(n_days, dtype=float)
+    log_effect[0] = rng.normal(0.0, sigma)
+    for d in range(1, n_days):
+        log_effect[d] = rho * log_effect[d - 1] + innovation[d]
+    return np.exp(log_effect)
+
+
 def generate(
     seed: int = SYNTHETIC_SEED,
     n_days: int = SYNTHETIC_N_DAYS,
@@ -279,16 +317,19 @@ def generate(
     """
     rng = np.random.default_rng(seed)
     dates = pd.date_range(pd.Timestamp(start_date), periods=n_days, freq="D")
-    is_weekend = (dates.dayofweek >= 5).to_numpy()
+    # 注意：pandas 3.0 起 DatetimeIndex.dayofweek 直接返回 numpy 数组，
+    # 不再有 .to_numpy()；用 np.asarray 包裹对 Index 与 ndarray 都成立。
+    is_weekend = np.asarray(dates.dayofweek) >= 5
 
     frames: list[pd.DataFrame] = []
 
     for prof in profiles:
         shape = np.asarray(prof.shape, dtype=float)
 
-        # ① 日效应：每个「场站 × 日历日」抽一次。这是模型看不到的隐变量，
-        #    也是模型误差真实存在的根本原因。
-        day_effect = rng.lognormal(mean=0.0, sigma=SYNTHETIC_SIGMA_DAY, size=n_days)
+        # ① 日效应：每个「场站 × 日历日」抽一次，且沿时间自相关（AR(1)）。
+        #    这是模型看不到的隐变量，也是模型误差真实存在的根本原因；
+        #    但它的**持续性**正是模型可以借滞后特征去追踪的部分。
+        day_effect = _ar1_day_effect(rng, n_days)
 
         # ② 到达强度 λ，形状 (n_days, 24)
         lam = (
